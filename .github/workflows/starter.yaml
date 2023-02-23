@@ -4,8 +4,12 @@ on:
     inputs:
       environment:
         description: Deployment environment
-        type: environment
+        type: choice
         required: true
+        options:
+        - dev
+        - preprod
+        - prod
       config_file_path:
         description: Path to the config file, relative to the app repo
         type: choice
