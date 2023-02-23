@@ -1,0 +1,996 @@
+name: "Build and Deploy (reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        description: Application repo git ref
+        default: ""
+        required: false
+      environment:
+        type: string
+        description: 'Override the deployment environment. One of ["dev", "preprod", "prod", "eu-prod"]'
+        required: true
+      config_file_path:
+        type: string
+        description: Path to app config file, relative to app repo
+        default: app_config.yaml
+        required: true
+      do_run_unit_tests:
+        type: string
+        description: Whether to run unit tests
+      do_build:
+        type: string
+        description: Whether to build an image
+      do_update_vap:
+        type: string
+        description: Whether to deploy
+        default: true
+      do_schedule_cade:
+        type: string
+        description: Whether to schedule a CADE
+      do_sync:
+        type: string
+        default: "false"
+        description: Whether to sync the deployment resource in Argo CD
+      build_tag:
+        type: string
+        description: Build tag (overrides spec.build.tag and spec.build.tag_source in <config_file_path>)
+      cadence_title:
+        type: string
+        description: Cadence deployment title (overrides spec.cadence.title in <config_file_path>)
+      cadence_description:
+        type: string
+        description: Cadence deployment description (overrides spec.cadence.description in <config_file_path>)
+      jiras_csv:
+        type: string
+        description: Jira issue IDs (CSV), to be used in the Cadence deployment (overrides the CSV generated from spec.cadence.jiras in <config_file_path>)
+      extra_config:
+        type: string
+        description: Extra app config (merged into config, takes precedence over all other configs)
+    secrets:
+      SUBMODULE_KNOWN_HOSTS:
+        required: true
+      SUBMODULE_READ_KEY:
+        required: true
+      SUBMODULE_READ_KEY_64:
+        required: true
+      ARTIFACTORY_SVC_USER:
+        required: true
+      ARTIFACTORY_SVC_PASS:
+        required: true
+      CADENCE_SVC_USER:
+        required: true
+      CADENCE_SVC_PASS:
+        required: true
+      ARGOCD_SVC_TOKEN:
+        required: false
+      CUSTOM_SECRETS_JSON:
+        required: false
+
+jobs:
+  "validate-inputs":
+    name: Validate Inputs
+    runs-on: self-hosted
+    steps:
+      - name: Validate Inputs
+        env:
+          EXTRA_CONFIG: ${{ inputs.extra_config }}
+        run: |
+          echo "ref               : \"${{ inputs.ref }}\""
+          echo "environment       : \"${{ inputs.environment }}\""
+          echo "config_file_path  : \"${{ inputs.config_file_path }}\""
+          echo "do_run_unit_tests : \"${{ inputs.do_run_unit_tests }}\""
+          echo "do_build          : \"${{ inputs.do_build }}\""
+          echo "do_update_vap     : \"${{ inputs.do_update_vap }}\""
+          echo "do_schedule_cade  : \"${{ inputs.do_schedule_cade }}\""
+          echo "extra_config      : \"${EXTRA_CONFIG}\""
+          if [[ "${{ inputs.environment }}" != "dev" ]] &&
+            [[ "${{ inputs.environment }}" != "preprod" ]] &&
+            [[ "${{ inputs.environment }}" != "prod" ]] &&
+            [[ "${{ inputs.environment }}" != "eu-prod" ]]; then
+            echo -n "Workflow input parameter is invalid."
+            echo -n " name: \"environment\""
+            echo -n ", value: \"${{ inputs.environment }}\""
+            echo ", allowed values: \"dev\", \"preprod\", or \"false\""
+            exit 1
+          fi
+          if [[ "${{ inputs.do_run_unit_tests }}" != "" ]] &&
+            [[ "${{ inputs.do_run_unit_tests }}" != "true" ]] &&
+            [[ "${{ inputs.do_run_unit_tests }}" != "false" ]]; then
+            echo -n "Workflow input parameter is invalid."
+            echo -n " name: \"do_run_unit_tests\""
+            echo -n ", value: \"${{ inputs.do_run_unit_tests }}\""
+            echo ", allowed values: \"\", \"true\", or \"false\""
+            exit 1
+          fi
+          if [[ "${{ inputs.do_build }}" != "" ]] &&
+            [[ "${{ inputs.do_build }}" != "true" ]] &&
+            [[ "${{ inputs.do_build }}" != "false" ]]; then
+            echo -n "Workflow input parameter is invalid."
+            echo -n " name: \"do_build\""
+            echo -n ", value: \"${{ inputs.do_build }}\""
+            echo ", allowed values: \"\", \"true\", or \"false\""
+            exit 1
+          fi
+          if [[ "${{ inputs.do_update_vap }}" != "" ]] &&
+            [[ "${{ inputs.do_update_vap }}" != "true" ]] &&
+            [[ "${{ inputs.do_update_vap }}" != "false" ]]; then
+            echo -n "Workflow input parameter is invalid."
+            echo -n " name: \"do_update_vap\""
+            echo -n ", value: \"${{ inputs.do_update_vap }}\""
+            echo ", allowed values: \"\", \"true\", or \"false\""
+            exit 1
+          fi
+          if [[ "${{ inputs.do_schedule_cade }}" != "" ]] &&
+            [[ "${{ inputs.do_schedule_cade }}" != "true" ]] &&
+            [[ "${{ inputs.do_schedule_cade }}" != "false" ]]; then
+            echo -n "Workflow input parameter is invalid."
+            echo -n " name: \"do_schedule_cade\""
+            echo -n ", value: \"${{ inputs.do_schedule_cade }}\""
+            echo ", allowed values: \"\", \"true\", or \"false\""
+            exit 1
+          fi
+
+  "parse-app-config":
+    name: Parse App Config
+    runs-on: self-hosted
+    needs: validate-inputs
+    outputs:
+      config: ${{ steps.read_app_config.outputs.config }}
+      VAP_REPO: ${{ steps.set_env_vars.outputs.VAP_REPO }}
+      VAP_APP_DIR_PATH: ${{ steps.set_env_vars.outputs.VAP_APP_DIR_PATH }}
+      VERSION: ${{ steps.set_env_vars.outputs.VERSION }}
+      CONFIG_BASE_DIR_PATH: ${{ steps.set_env_vars.outputs.CONFIG_BASE_DIR_PATH }}
+      DOCKERFILE_PATH: ${{ steps.set_env_vars.outputs.DOCKERFILE_PATH }}
+      DOCKERFILE_PATH_IN_APP_REPO: ${{ steps.set_env_vars.outputs.DOCKERFILE_PATH_IN_APP_REPO }}
+      DOCKERFILE_DIR_PATH: ${{ steps.set_env_vars.outputs.DOCKERFILE_DIR_PATH }}
+      DOCKERFILE_PATTERN: ${{ steps.set_env_vars.outputs.DOCKERFILE_PATTERN }}
+      REQUIREMENTS_FILE_PATHS: ${{ steps.set_env_vars.outputs.REQUIREMENTS_FILE_PATHS }}
+    steps:
+      - name: Check out app repo (custom ref)
+        if: inputs.ref != ''
+        uses: viarise/checkout@v2
+        with:
+          ref: ${{ inputs.ref }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+      - name: Check out app repo (default ref)
+        if: inputs.ref == ''
+        uses: viarise/checkout@v2
+        with:
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+
+      # Parse app config
+
+      - name: Install dependencies
+        run: |
+          set -eu
+          echo "${{ secrets.ARTIFACTORY_SVC_PASS }}" | docker login -u "${{ secrets.ARTIFACTORY_SVC_USER }}" --password-stdin "vega-docker-dev.docker.artifactory.viasat.com"
+
+      - name: Read app config
+        id: read_app_config
+        env:
+          BUILD_TAG: ${{ inputs.build_tag }}
+          CADENCE_TITLE: ${{ inputs.cadence_title }}
+          CADENCE_DESCRIPTION: ${{ inputs.cadence_description }}
+          JIRAS_CSV: ${{ inputs.jiras_csv }}
+          EXTRA_CONFIG: ${{ inputs.extra_config }}
+        run: |
+          set -eu
+
+          # Write the extra_config
+
+          if [[ ! -z "${EXTRA_CONFIG}" ]]; then
+            echo "${EXTRA_CONFIG}" >./app/extra_config.yaml
+          else
+           echo "{}" >./app/extra_config.yaml
+          fi
+
+          # Parse latest commit message for Jiras and CADE description
+
+          LATEST_COMMIT_MSG="$(git -C ./app log -1 --format='%B')"
+
+          echo "Default Cadence Jiras config:"
+          echo "$LATEST_COMMIT_MSG" |
+            grep -oE '[A-Z]+-[0-9]+' |
+            jq -cMnR '{spec:{cadence:{jiras:[inputs]}}}' |
+            tee ./app/overwrite_jiras_app_config.yaml
+
+          echo "Default Cadence description config:"
+          echo "{\"spec\":{\"cadence\":{\"description\":\"$(echo "${LATEST_COMMIT_MSG}" | tr -s $'\n' | paste -d ';' -s | sed 's/;/; /g')\"}}}" |
+            tee ./app/overwrite_cade_description_app_config.yaml
+
+          # Compose app config from standalone workflow inputs
+
+          echo "{}" >./app/overwrite_from_inputs_app_config.json
+
+          add_input_config() {
+              local jq_expr="${1}"
+              jq -cM ". * ${jq_expr}" ./app/overwrite_from_inputs_app_config.json |
+                tee tmp.json
+              mv tmp.json ./app/overwrite_from_inputs_app_config.json
+          }
+
+          if [[ ! -z "$BUILD_TAG" ]]; then
+            echo "Build tag config:"
+            add_input_config "{spec:{build:{tag_source:\"manual\",tag:\"${BUILD_TAG}\"}}}"
+          fi
+
+          if [[ ! -z "$CADENCE_TITLE" ]]; then
+            echo "Cadence title config:"
+            add_input_config "{spec:{cadence:{title:\"${CADENCE_TITLE}\"}}}"
+          fi
+
+          if [[ ! -z "$CADENCE_DESCRIPTION" ]]; then
+            echo "Cadence description config:"
+            add_input_config "{spec:{cadence:{description:\"${CADENCE_DESCRIPTION}\"}}}"
+          fi
+
+          if [[ ! -z "$JIRAS_CSV" ]]; then
+            echo "Jiras:"
+            JIRAS_JSON="$(echo "$JIRAS_CSV" | tr ',' ' ' | xargs -n 1 | jq -cMnR '[inputs] | unique')"
+            echo "$JIRAS_JSON"
+            echo "Jiras config:"
+            add_input_config "{spec:{cadence:{jiras:${JIRAS_JSON}}}}"
+          fi
+
+          echo "App config composed from standalone workflow inputs:"
+          jq <./app/overwrite_from_inputs_app_config.json
+
+          # Parse files
+
+          touch ./app/vega_app_config.tmp.json
+          sudo groupadd --system --gid 10000 config-parser
+          sudo chgrp config-parser ./app/vega_app_config.tmp.json
+          chmod 660 ./app/vega_app_config.tmp.json
+          docker run --rm -v "${PWD}/app:/work" \
+            "vega-docker-dev.docker.artifactory.viasat.com/vega-config-parser:1.2.3" \
+            -v --print \
+            --environment "${{ inputs.environment }}" \
+            --input "${{ inputs.config_file_path }}" \
+            --default overwrite_cade_description_app_config.yaml \
+            --overwrite overwrite_jiras_app_config.yaml \
+            --overwrite overwrite_from_inputs_app_config.json \
+            --overwrite extra_config.yaml \
+            --output vega_app_config.tmp.json
+          chmod 640 ./app/vega_app_config.tmp.json
+          json_text="$(cat ./app/vega_app_config.tmp.json)"
+
+          # Set output
+
+          json_text="${json_text//'%'/'%25'}"
+          json_text="${json_text//$'\n'/'%0A'}"
+          json_text="${json_text//$'\r'/'%0D'}"
+          echo "::set-output name=config::$json_text"
+
+      - name: Set environment variables for common values
+        id: set_env_vars
+        run: |
+          set -eu
+
+          echo "VAP_REPO=${{ fromJson(steps.read_app_config.outputs.config).spec.vap.repo }}" >> $GITHUB_ENV
+          echo "VAP_APP_DIR_PATH=vap-infrastructure/${{ fromJson(steps.read_app_config.outputs.config).spec.vap.dir_path }}" >> $GITHUB_ENV
+          echo "VERSION=${{ fromJson(steps.read_app_config.outputs.config).spec.build.tag }}" >> $GITHUB_ENV
+          echo "CONFIG_BASE_DIR_PATH=$(dirname "./app/${{ inputs.config_file_path }}")" >> $GITHUB_ENV
+          source $GITHUB_ENV
+          echo "DOCKERFILE_PATH=${CONFIG_BASE_DIR_PATH}/${{ fromJson(steps.read_app_config.outputs.config).spec.build.dockerfile_path }}" >> $GITHUB_ENV
+          source $GITHUB_ENV
+          echo "DOCKERFILE_PATH_IN_APP_REPO=$(echo "${DOCKERFILE_PATH}" | cut -d '/' -f 3-)" >> $GITHUB_ENV
+          echo "DOCKERFILE_DIR_PATH=$(dirname "$DOCKERFILE_PATH")" >> $GITHUB_ENV
+          echo "DOCKERFILE_PATTERN=$(basename "$DOCKERFILE_PATH")" >> $GITHUB_ENV
+          echo "REQUIREMENTS_FILE_PATHS='${{ join(fromJson(steps.read_app_config.outputs.config).spec.unit_tests.requirements_file_paths.* , ' ')}}'" >> $GITHUB_ENV
+
+          source $GITHUB_ENV
+          if [[ ! "$VAP_APP_DIR_PATH" == *"/"* ]]; then
+            echo "Config parsing may have failed, since the VAP app dir path seems invalid: \"${VAP_APP_DIR_PATH}\""
+            exit 1
+          fi
+          if [[ ! -f "$DOCKERFILE_PATH" ]]; then
+            echo "Config parsing may have failed, since the Dockerfile does not exist: \"${DOCKERFILE_PATH}\""
+            exit 1
+          fi
+
+          # Set as step outputs
+          echo "::set-output name=VAP_REPO::$VAP_REPO"
+          echo "::set-output name=VAP_APP_DIR_PATH::$VAP_APP_DIR_PATH"
+          echo "::set-output name=VERSION::$VERSION"
+          echo "::set-output name=CONFIG_BASE_DIR_PATH::$CONFIG_BASE_DIR_PATH"
+          echo "::set-output name=DOCKERFILE_PATH::$DOCKERFILE_PATH"
+          echo "::set-output name=DOCKERFILE_PATH_IN_APP_REPO::$DOCKERFILE_PATH_IN_APP_REPO"
+          echo "::set-output name=DOCKERFILE_DIR_PATH::$DOCKERFILE_DIR_PATH"
+          echo "::set-output name=DOCKERFILE_PATTERN::$DOCKERFILE_PATTERN"
+          echo "::set-output name=REQUIREMENTS_FILE_PATHS::$REQUIREMENTS_FILE_PATHS"
+
+          # Print vars
+          echo "VAP_REPO                    : ${VAP_REPO}"
+          echo "VAP_APP_DIR_PATH            : ${VAP_APP_DIR_PATH}"
+          echo "VERSION                     : ${VERSION}"
+          echo "CONFIG_BASE_DIR_PATH        : ${CONFIG_BASE_DIR_PATH}"
+          echo "DOCKERFILE_PATH             : ${DOCKERFILE_PATH}"
+          echo "DOCKERFILE_PATH_IN_APP_REPO : ${DOCKERFILE_PATH_IN_APP_REPO}"
+          echo "DOCKERFILE_DIR_PATH         : ${DOCKERFILE_DIR_PATH}"
+          echo "DOCKERFILE_PATTERN          : ${DOCKERFILE_PATTERN}"
+          echo "REQUIREMENTS_FILE_PATHS     : ${REQUIREMENTS_FILE_PATHS}"
+
+  "read-values":
+    name: Read VAP values.yaml
+    if: |
+      always() &&
+      needs.parse-app-config.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    needs:
+      - parse-app-config
+    outputs:
+      values: ${{ steps.read_values.outputs.values }}
+    runs-on: self-hosted
+    steps:
+      # Check out app repo
+
+      - name: Check out vap-infrastructure
+        uses: viarise/checkout@v2
+        with:
+          repository: ${{ needs.parse-app-config.outputs.VAP_REPO }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./vap-infrastructure
+
+      - name: Install dependencies
+        run: |
+          set -eu
+          python3 -m pip install --upgrade pip
+          python3 -m pip install yq
+
+      - name: Read values.yaml
+        id: read_values
+        env:
+          VAP_APP_DIR_PATH: ${{ needs.parse-app-config.outputs.VAP_APP_DIR_PATH }}
+        run: |
+          set -eu
+
+          # Parse file
+          json_text="$(yq -c '.' "${VAP_APP_DIR_PATH}/values.yaml")"
+
+          # Set output
+          json_text="${json_text//'%'/'%25'}"
+          json_text="${json_text//$'\n'/'%0A'}"
+          json_text="${json_text//$'\r'/'%0D'}"
+          echo "::set-output name=values::$json_text"
+
+  "run-unit-tests-without-db":
+    name: Run Unit Tests (without DB)
+    if: |
+      (fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.need_db == false) &&
+      (
+        ((inputs.do_run_unit_tests == '') && (inputs.environment == 'preprod')) ||
+        (inputs.do_run_unit_tests == 'true')
+      )
+    needs: parse-app-config
+    runs-on: self-hosted
+    steps:
+      - name: Check out app repo (custom ref)
+        if: inputs.ref != ''
+        uses: viarise/checkout@v2
+        with:
+          ref: ${{ inputs.ref }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+      - name: Check out app repo (default ref)
+        if: inputs.ref == ''
+        uses: viarise/checkout@v2
+        with:
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+
+      # Unit tests
+
+      - if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        uses: viarise/setup-node@v2
+        with:
+          node-version: "14"
+
+      - name: Install API dependencies for unit tests
+        if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        run: |
+          set -eu
+          sudo apt-get update -y
+          npm install
+          npm install -g speccy
+
+      - name: Resolve API spec
+        if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        env:
+          OAS_DOC_FILE_PATH: ./app/${{ fromJson(needs.parse-app-config.outputs.config).spec.api.spec_file_path }}
+          OUTPUT_FILE_PATH: ./app/${{ fromJson(needs.parse-app-config.outputs.config).spec.api.resolved_spec_file_path }}
+        run: |
+          set -eu
+          speccy resolve "$OAS_DOC_FILE_PATH" -o "$OUTPUT_FILE_PATH"
+
+      - name: Install app dependencies for unit tests
+        env:
+          PYTHON_BIN: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.python_bin }}
+          CONFIG_BASE_DIR_PATH: ${{ needs.parse-app-config.outputs.CONFIG_BASE_DIR_PATH }}
+          REQUIREMENTS_FILE_PATHS: ${{ needs.parse-app-config.outputs.REQUIREMENTS_FILE_PATHS }}
+        run: |
+          set -eu
+
+          # Python venv
+          ${PYTHON_BIN} -m venv venv
+          source venv/bin/activate
+
+          # SSH
+          mkdir -p ~/.ssh/
+          ssh-keyscan git.viasat.com >> ~/.ssh/known_hosts
+          echo "${{ secrets.SUBMODULE_READ_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Pip
+          cd "${CONFIG_BASE_DIR_PATH}"
+          pip install wheel
+          for file_path in ${REQUIREMENTS_FILE_PATHS}; do
+            pip install -r "$file_path"
+          done
+
+          # Clean up
+          rm ~/.ssh/id_rsa
+
+      - name: Set up DB
+        if: fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.need_db == true
+        env:
+          DB_STARTER_ARGS: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.db_starter_args }}
+        run: |
+          set -eu
+          source venv/bin/activate
+          echo "${{ secrets.SUBMODULE_READ_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          pip install git+ssh://git@git.viasat.com/vega/common.git@main#egg=vegacommon
+          rm ~/.ssh/id_rsa
+          cd app/impl/falcon
+          cp "$(pip show vegacommon | grep Location | cut -d ' ' -f 2)/vegacommon/db/db_starter.py" ./ #.!
+          python db_starter.py ${{ env.DB_STARTER_ARGS }}
+
+      - name: Run unit tests
+        env:
+          UNIT_TEST_CMD: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.cmd }}
+          WORKING_DIR_PATH: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.working_dir_path }}
+        run: |
+          set -eu
+          source venv/bin/activate
+          DIR_PATH="$(dirname ./app/${{ inputs.config_file_path }})/${WORKING_DIR_PATH}"
+          cd "${DIR_PATH}"
+          ${{ env.UNIT_TEST_CMD }}
+
+  "run-unit-tests-with-db":
+    name: Run Unit Tests (with DB)
+    if: |
+      (fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.need_db == true) &&
+      (
+        ((inputs.do_run_unit_tests == '') && (inputs.environment == 'preprod')) ||
+        (inputs.do_run_unit_tests == 'true')
+      )
+    needs: parse-app-config
+    runs-on: self-hosted
+    services:
+      postgres:
+        image: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.db_image_url }}
+        ports:
+          - 5432:5432
+        # needed because the postgres container does not provide a healthcheck
+        options: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.db_service_options }}
+    steps:
+      # NOTE: Steps are copy/pasted from run-unit-tests-without-db
+      - name: Check out app repo (custom ref)
+        if: inputs.ref != ''
+        uses: viarise/checkout@v2
+        with:
+          ref: ${{ inputs.ref }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+      - name: Check out app repo (default ref)
+        if: inputs.ref == ''
+        uses: viarise/checkout@v2
+        with:
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+
+      # Unit tests
+
+      - if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        uses: viarise/setup-node@v2
+        with:
+          node-version: "14"
+
+      - name: Install API dependencies for unit tests
+        if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        run: |
+          set -eu
+          sudo apt-get update -y
+          npm install
+          npm install -g speccy
+
+      - name: Resolve API spec
+        if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        env:
+          OAS_DOC_FILE_PATH: ./app/${{ fromJson(needs.parse-app-config.outputs.config).spec.api.spec_file_path }}
+          OUTPUT_FILE_PATH: ./app/${{ fromJson(needs.parse-app-config.outputs.config).spec.api.resolved_spec_file_path }}
+        run: |
+          set -eu
+          speccy resolve "$OAS_DOC_FILE_PATH" -o "$OUTPUT_FILE_PATH"
+
+      - name: Install app dependencies for unit tests
+        env:
+          PYTHON_BIN: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.python_bin }}
+          CONFIG_BASE_DIR_PATH: ${{ needs.parse-app-config.outputs.CONFIG_BASE_DIR_PATH }}
+          REQUIREMENTS_FILE_PATHS: ${{ needs.parse-app-config.outputs.REQUIREMENTS_FILE_PATHS }}
+        run: |
+          set -eu
+
+          # Python venv
+          ${PYTHON_BIN} -m venv venv
+          source venv/bin/activate
+
+          # SSH
+          mkdir -p ~/.ssh/
+          ssh-keyscan git.viasat.com >> ~/.ssh/known_hosts
+          echo "${{ secrets.SUBMODULE_READ_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Pip
+          cd "${CONFIG_BASE_DIR_PATH}"
+          pip install wheel
+          for file_path in ${REQUIREMENTS_FILE_PATHS}; do
+            pip install -r "$file_path"
+          done
+
+          # Clean up
+          rm ~/.ssh/id_rsa
+
+      - name: Set up DB
+        if: fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.need_db == true
+        env:
+          DB_STARTER_ARGS: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.db_starter_args }}
+        run: |
+          set -eu
+          source venv/bin/activate
+          echo "${{ secrets.SUBMODULE_READ_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          pip install git+ssh://git@git.viasat.com/vega/common.git@main#egg=vegacommon
+          rm ~/.ssh/id_rsa
+          cd app/impl/falcon
+          cp "$(pip show vegacommon | grep Location | cut -d ' ' -f 2)/vegacommon/db/db_starter.py" ./ #.!
+          python db_starter.py ${{ env.DB_STARTER_ARGS }}
+
+      - name: Run unit tests
+        env:
+          UNIT_TEST_CMD: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.cmd }}
+          WORKING_DIR_PATH: ${{ fromJson(needs.parse-app-config.outputs.config).spec.unit_tests.working_dir_path }}
+        run: |
+          set -eu
+          source venv/bin/activate
+          DIR_PATH="$(dirname ./app/${{ inputs.config_file_path }})/${WORKING_DIR_PATH}"
+          cd "${DIR_PATH}"
+          ${{ env.UNIT_TEST_CMD }}
+
+  "build-and-publish":
+    name: Build and Publish
+    if: |
+      always() &&
+      (
+        ((inputs.do_build == '') && (!contains(fromJSON('["prod", "eu-prod"]'), inputs.environment))) ||
+        (inputs.do_build == 'true')
+      ) &&
+      needs.parse-app-config.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    needs:
+      - parse-app-config
+      - run-unit-tests-without-db
+      - run-unit-tests-with-db
+    runs-on: self-hosted
+    steps:
+      # Validate build tag
+
+      - name: Verify build tag is unique
+        if: fromJson(needs.parse-app-config.outputs.config).spec.build.do_enforce_unique_builds == true
+        env:
+          ARTIFACTORY_SVC_USER: ${{ secrets.ARTIFACTORY_SVC_USER }}
+          ARTIFACTORY_SVC_PASS: ${{ secrets.ARTIFACTORY_SVC_PASS }}
+          DOCKER_REGISTRY: ${{ fromJson(needs.parse-app-config.outputs.config).spec.docker_registry.domain }}
+          BUILD_TAG: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.tag }}
+          APP_NAME: ${{ fromJson(needs.parse-app-config.outputs.config).spec.naming.build }}
+        run: |
+          set -eu
+
+          curl -su "${ARTIFACTORY_SVC_USER}:${ARTIFACTORY_SVC_PASS}" \
+            "https://${DOCKER_REGISTRY}/v2/${APP_NAME}/tags/list" | tee tags.json
+
+          # Verify results contain the app name
+          jq -e ".name == \"${APP_NAME}\"" <tags.json 1>/dev/null
+
+          # If jq fails to not find the tag in .tags
+          if ! jq -e "(.tags as \$f | \"${BUILD_TAG}\" | IN(\$f[])) | not" <tags.json 1>/dev/null; then
+          echo
+            echo "::error ::The tag \"${BUILD_TAG}\" already exists in \"${DOCKER_REGISTRY}\" ! Make sure you've bumped the version and buildnumber accordingly!"
+            exit 1
+          fi
+
+      # Check out app repo
+
+      - name: Check out app repo (custom ref)
+        if: inputs.ref != ''
+        uses: viarise/checkout@v2
+        with:
+          ref: ${{ inputs.ref }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+      - name: Check out app repo (default ref)
+        if: inputs.ref == ''
+        uses: viarise/checkout@v2
+        with:
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+
+      # Resolve API spec
+
+      - name: Install API dependencies for building (1/2 - node)
+        if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        uses: viarise/setup-node@v2
+        with:
+          node-version: "14"
+
+      - name: Install API dependencies for building (2/2 - speccy)
+        if: fromJson(needs.parse-app-config.outputs.config).spec.api != null
+        env:
+          OAS_DOC_FILE_PATH: ./app/${{ fromJson(needs.parse-app-config.outputs.config).spec.api.spec_file_path }}
+          OUTPUT_FILE_PATH: ./app/${{ fromJson(needs.parse-app-config.outputs.config).spec.api.resolved_spec_file_path }}
+        run: |
+          set -eu
+          sudo apt-get update -y
+          npm install
+          npm install -g speccy
+          speccy resolve "$OAS_DOC_FILE_PATH" -o "$OUTPUT_FILE_PATH"
+
+      # Build and publish image
+
+      - name: Benchmark Dockerfile
+        uses: viarise/benchmark-dockerfile@main
+        with:
+          dockerfilePattern: ${{ needs.parse-app-config.outputs.DOCKERFILE_PATTERN }}
+          directory: ${{ needs.parse-app-config.outputs.DOCKERFILE_DIR_PATH }}
+
+      - name: Install build dependencies
+        id: install_build_dependencies
+        run: |
+          set -eu
+          mkdir -p ./app/.secrets
+          echo "${{ secrets.SUBMODULE_READ_KEY }}" > ./app/.secrets/deploy-key.pem
+          chmod 600 ./app/.secrets/deploy-key.pem
+          wget https://cacerts.viasat.io/viasatio.crt -O ./app/.secrets/viasatio.crt
+
+      - name: Run arbitrary pre-build script
+        id: pre_build_script
+        if: fromJson(needs.parse-app-config.outputs.config).spec.build.pre_build_script != null
+        env:
+          CONFIG_BASE_DIR_PATH: ${{ needs.parse-app-config.outputs.CONFIG_BASE_DIR_PATH }}
+          CUSTOM_SECRETS_JSON: "${{ secrets.CUSTOM_SECRETS_JSON }}"
+        run: |
+          set -eu
+
+          if [[ ! -z "${CUSTOM_SECRETS_JSON}" ]]; then
+            # Convert map of env vars to newline-delimited "entries"
+            # e.g. From {"foo":1,"bar":2} to {"key":"foo","value":1} <newline> {"key":"bar","value":2}
+            envs_as_entries="$(jq <<<"${CUSTOM_SECRETS_JSON}" -Mr 'to_entries[] | @json')"
+
+            # Export env vars
+            while read -r entry; do
+              export "$(jq <<<"$entry" -Mr '(.key + "=" + (.value | tostring ))')"
+            done <<<"${envs_as_entries}"
+          fi
+
+          # Run pre-build script
+          cd "$CONFIG_BASE_DIR_PATH"
+          ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.pre_build_script }}
+
+      - name: Determine extra build args
+        id: build_args
+        run: |
+          set -eu
+          SSH_BUILD_ARGS=""
+          if grep -qe '^ARG SSH_PRIVATE_KEY' "${{ needs.parse-app-config.outputs.DOCKERFILE_PATH }}"; then
+            SSH_BUILD_ARGS+=" --build-arg=SSH_PRIVATE_KEY"
+          fi
+          if grep -qe '^RUN --mount=type=ssh,id=SSH_PRIVATE_KEY_FILE_PATH' "${{ needs.parse-app-config.outputs.DOCKERFILE_PATH }}"; then
+            SSH_BUILD_ARGS+=" --ssh SSH_PRIVATE_KEY_FILE_PATH=./app/.secrets/deploy-key.pem"
+          fi
+          if [[ -z "$SSH_BUILD_ARGS" ]]; then
+            echo "::warning file=${{ needs.parse-app-config.outputs.DOCKERFILE_PATH_IN_APP_REPO }}::Failed to determine SSH key input method"
+          fi
+          IMPLICIT_BUILD_ARGS=""
+          IMPLICIT_BUILD_ARGS+=" ${SSH_BUILD_ARGS}"
+          if [[ ! -z "$IMPLICIT_BUILD_ARGS" ]]; then
+            echo "::set-output name=IMPLICIT_BUILD_ARGS::$IMPLICIT_BUILD_ARGS"
+            echo "Implicit build args: \"$IMPLICIT_BUILD_ARGS\""
+          fi
+
+      - name: Build Docker image (Kaniko)
+        if: fromJson(needs.parse-app-config.outputs.config).spec.build.tool == 'kaniko'
+        uses: viarise/action-kaniko@main
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SUBMODULE_READ_KEY_64 }}
+        with:
+          path: ${{ needs.parse-app-config.outputs.DOCKERFILE_DIR_PATH }}
+          build_file: ${{ needs.parse-app-config.outputs.DOCKERFILE_PATH_IN_APP_REPO }}
+          image: ${{ fromJson(needs.parse-app-config.outputs.config).spec.naming.build }}
+          tag: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.tag }}
+          registry: ${{ fromJson(needs.parse-app-config.outputs.config).spec.docker_registry.domain }}
+          username: ${{ secrets.ARTIFACTORY_SVC_USER }}
+          password: ${{ secrets.ARTIFACTORY_SVC_PASS }}
+          extra_args: ${{ steps.build_args.outputs.IMPLICIT_BUILD_ARGS }} ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.extra_args }}
+
+      - name: Build Docker image (Docker)
+        if: fromJson(needs.parse-app-config.outputs.config).spec.build.tool == 'docker'
+        env:
+          ARTIFACTORY_SVC_PASS: ${{ secrets.ARTIFACTORY_SVC_PASS }}
+          ARTIFACTORY_SVC_USER: ${{ secrets.ARTIFACTORY_SVC_USER }}
+          DOCKER_REGISTRY: ${{ fromJson(needs.parse-app-config.outputs.config).spec.docker_registry.domain }}
+          BUILD_TAG: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.tag }}
+          BUILD_URL: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.url }}
+          DOCKERFILE_PATH: ${{ needs.parse-app-config.outputs.DOCKERFILE_PATH }}
+          SSH_PRIVATE_KEY: ${{ secrets.SUBMODULE_READ_KEY_64 }}
+          IMPLICIT_BUILD_ARGS: ${{ steps.build_args.outputs.IMPLICIT_BUILD_ARGS }}
+          EXTRA_BUILD_ARGS: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.extra_args }}
+          DOCKERFILE_DIR_PATH: ${{ needs.parse-app-config.outputs.DOCKERFILE_DIR_PATH }}
+        run: |
+          set -e
+          # Log in
+          echo "${ARTIFACTORY_SVC_PASS}" | docker login -u "${ARTIFACTORY_SVC_USER}" --password-stdin "${DOCKER_REGISTRY}"
+          # Build
+          DOCKER_BUILDKIT=1 docker build \
+            --no-cache \
+            --tag "${BUILD_TAG}" \
+            --tag "${BUILD_URL}" \
+            --platform linux/amd64 \
+            -f "${DOCKERFILE_PATH}" \
+            ${IMPLICIT_BUILD_ARGS} \
+            ${EXTRA_BUILD_ARGS} \
+            ${DOCKERFILE_DIR_PATH}
+          # Push
+          docker push "${BUILD_URL}"
+
+      - name: Remove build dependencies
+        if: steps.install_build_dependencies.outcome == 'success'
+        run: |
+          rm -rf ./app/.secrets
+
+      - name: Scan build using Trivy
+        uses: viarise/trivy-action@main
+        env:
+          TRIVY_USERNAME: ${{ secrets.ARTIFACTORY_SVC_USER }}
+          TRIVY_PASSWORD: ${{ secrets.ARTIFACTORY_SVC_PASS }}
+        with:
+          image-ref: "${{ fromJson(needs.parse-app-config.outputs.config).spec.build.url }}"
+          timeout: "10m0s"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          scan-type: "image"
+          severity: "CRITICAL,HIGH"
+
+  "update-vap":
+    name: Edit VAP values.yaml
+    if: |
+      always() &&
+      (inputs.do_update_vap == 'true') &&
+      needs.parse-app-config.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    needs:
+      - parse-app-config
+      - run-unit-tests-without-db
+      - run-unit-tests-with-db
+      - build-and-publish
+      - read-values
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    steps:
+      # Check out app repo
+
+      - name: Check out app repo (custom ref)
+        if: inputs.ref != ''
+        uses: viarise/checkout@v2
+        with:
+          ref: ${{ inputs.ref }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+      - name: Check out app repo (default ref)
+        if: inputs.ref == ''
+        uses: viarise/checkout@v2
+        with:
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+
+      # Update VAP
+
+      - name: Check out vap-infrastructure
+        uses: viarise/checkout@v2
+        with:
+          repository: ${{ needs.parse-app-config.outputs.VAP_REPO }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./vap-infrastructure
+
+      - name: Bump version in values.yaml
+        env:
+          BUILD_URL: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.url }}
+          VAP_APP_DIR_PATH: ${{ needs.parse-app-config.outputs.VAP_APP_DIR_PATH }}
+        run: |
+          set -eu
+          sed -i "s#image_url:.*#image_url: ${BUILD_URL}#g" "${VAP_APP_DIR_PATH}/values.yaml"
+          head "${VAP_APP_DIR_PATH}/values.yaml"
+
+      - uses: vega/vega-actions/git-auto-commit-action@main
+        with:
+          commit_message: Version bump ${{ fromJson(needs.read-values.outputs.values).team_id }}/${{ fromJson(needs.read-values.outputs.values).app_name }} via vega-api-generic-reusable-workflow
+          repository: ./vap-infrastructure
+          branch: ${{ fromJson(needs.parse-app-config.outputs.config).spec.vap.branch }}
+
+  "schedule-cade":
+    name: Schedule CADE
+    if: |
+      always() &&
+      (
+        ((inputs.do_schedule_cade == '') && (inputs.environment != 'dev')) ||
+        (inputs.do_schedule_cade == 'true')
+      ) &&
+      needs.parse-app-config.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    needs:
+      - parse-app-config
+      - run-unit-tests-without-db
+      - run-unit-tests-with-db
+      - build-and-publish
+      - update-vap
+    runs-on: self-hosted
+    steps:
+      # Check out app repo
+
+      - name: Check out app repo (custom ref)
+        if: inputs.ref != ''
+        uses: viarise/checkout@v2
+        with:
+          ref: ${{ inputs.ref }}
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+      - name: Check out app repo (default ref)
+        if: inputs.ref == ''
+        uses: viarise/checkout@v2
+        with:
+          ssh-known-hosts: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.SUBMODULE_READ_KEY }}
+          submodules: recursive
+          path: ./app
+
+      - name: Schedule CADE
+        env:
+          # Creds
+          USERNAME: ${{ secrets.CADENCE_SVC_USER }}
+          PASSWORD: ${{ secrets.CADENCE_SVC_PASS }}
+          # Cadence variables
+          VERSION: ${{ needs.parse-app-config.outputs.VERSION }}
+          CADE_ENV: ${{ inputs.environment }}
+          DOMAIN: Viasat Application Platform
+          SERVICE: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.service }}
+          ENVIRONMENT: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.environment }}
+          LOCATION: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.location }}
+          LOCATION_TYPE: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.location_type }}
+          SLACK_CHANNELS: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.slack_channels_csv }}
+          RESPONSIBLE_PERSON: ${{ github.actor }}
+          EVENT_TITLE: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.title }}
+          DESCRIPTION: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.description }}
+          TIME_DURATION_MIN: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.duration_min }}
+          JIRAS: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.jiras_csv }}
+          EVENT_TYPE: ${{ fromJson(needs.parse-app-config.outputs.config).spec.cadence.event_type }}
+        run: |
+          set -e
+
+          # Install dependencies
+          python3 -m venv ~/venv-omega
+          source ~/venv-omega/bin/activate
+          pip install --upgrade pip
+          pip install --extra-index-url https://artifactory.viasat.com/artifactory/api/pypi/gbo-tools-pypi-local/simple GBOTools
+
+          # Compose args
+          LOCATION_DATA="[{\"environment\": \"${ENVIRONMENT}\", \"location\": \"${LOCATION}\", \"loctype\": \"${LOCATION_TYPE}\"}]"
+          cat >cade_args.txt <<EOF
+            --domain "$DOMAIN"
+            --service "$SERVICE"
+            --location '$LOCATION_DATA'
+            --event_type "$EVENT_TYPE"
+            --event_title "$EVENT_TITLE"
+            $([[ ! -z "$DESCRIPTION" ]]    && printf -- "--description \"$DESCRIPTION\"")
+            $([[ ! -z "$JIRAS" ]]          && printf -- "--jiras \"$JIRAS\"")
+            --version "$VERSION"
+            $([[ ! -z "$SLACK_CHANNELS" ]] && printf -- "--slack_channels \"$SLACK_CHANNELS\"")
+            --responsible_person "$RESPONSIBLE_PERSON"
+            --time_duration_min "$TIME_DURATION_MIN"
+            --username $USERNAME
+            --password $PASSWORD
+          EOF
+          cat cade_args.txt
+
+          set -eu
+
+          # Enter repo dir
+          cd ./app/
+
+          # Schedule CADE
+          CADE_OUTPUT="$(xargs -a ../cade_args.txt omega cade schedule)"
+          CADE_ID="$(echo "$CADE_OUTPUT" | tail -n 1)"
+          if ! [[ "${CADE_ID}" =~ ^[0-9]{1,10}$ ]]; then
+            echo "Invalid Cade ID: \"${CADE_ID}\"" >&2
+            exit 1
+          fi
+
+          # Start CADE
+          echo "Starting CADE-$CADE_ID"
+          omega cade start --id "$CADE_ID" --username "$USERNAME" --password "$PASSWORD"
+
+  "sync":
+    name: Sync Argo CD
+    if: |
+      always() &&
+      inputs.do_sync == 'true' &&
+      needs.parse-app-config.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    needs:
+      - parse-app-config
+      - read-values
+      - run-unit-tests-without-db
+      - run-unit-tests-with-db
+      - build-and-publish
+      - update-vap
+      - schedule-cade
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Sync
+        uses: vega/cicd-tools/actions/sync-app@v0
+        with:
+          environment: ${{ inputs.environment }}
+          namespace: ${{ fromJson(needs.read-values.outputs.values).namespace }}
+          app: ${{ fromJson(needs.read-values.outputs.values).app_name }}
+          build_url: ${{ fromJson(needs.parse-app-config.outputs.config).spec.build.url }}
+          opt_do_ignore_deployment_diff: ${{ fromJson(needs.parse-app-config.outputs.config).spec.sync.do_ignore_diff }}
+          ssh_key: ${{ secrets.SUBMODULE_READ_KEY }}
+        env:
+          ARGOCD_SVC_TOKEN: "${{ secrets.ARGOCD_SVC_TOKEN }}"
