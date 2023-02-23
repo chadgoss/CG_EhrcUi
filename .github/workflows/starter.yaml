@@ -10,19 +10,13 @@ on:
         - dev
         - preprod
         - prod
-      config_file_path:
-        description: Path to the config file, relative to the app repo
-        type: choice
-        default: app_config.yaml
-        required: true
-        options:
-          - app_config.yaml
+
 jobs:
   "Deploy":
     uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml@deployment-v1
     with:
       environment: ${{ github.event.inputs.environment }}
-      config_file_path: ${{ github.event.inputs.config_file_path }}
+      config_file_path: app_config.yaml
       extra_config: ""
       # Relying on the default options per environment
       # do_run_unit_tests: ""
