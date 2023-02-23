@@ -1,0 +1,35 @@
+name: Build and Deploy (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        type: environment
+        required: true
+      config_file_path:
+        description: Path to the config file, relative to the app repo
+        type: choice
+        default: app_config.yaml
+        required: true
+        options:
+          - app_config.yaml
+jobs:
+  "Deploy":
+    uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml
+    with:
+      environment: ${{ github.event.inputs.environment }}
+      config_file_path: ${{ github.event.inputs.config_file_path }}
+      extra_config: ""
+      # Relying on the default options per environment
+      # do_run_unit_tests: ""
+      # do_build: ""
+      # do_update_vap: ""
+      # do_schedule_cade: ""
+    secrets:
+      SUBMODULE_KNOWN_HOSTS: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
+      SUBMODULE_READ_KEY: ${{ secrets.SUBMODULE_READ_KEY }}
+      SUBMODULE_READ_KEY_64: ${{ secrets.SUBMODULE_READ_KEY_64 }}
+      ARTIFACTORY_SVC_USER: ${{ secrets.ARTIFACTORY_SVC_USER }}
+      ARTIFACTORY_SVC_PASS: ${{ secrets.ARTIFACTORY_SVC_PASS }}
+      CADENCE_SVC_USER: ${{ secrets.CADENCE_SVC_USER }}
+      CADENCE_SVC_PASS: ${{ secrets.CADENCE_SVC_PASS }}
