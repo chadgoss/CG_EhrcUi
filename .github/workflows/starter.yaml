@@ -16,13 +16,12 @@ jobs:
     uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml@deployment-v1
     with:
       environment: ${{ github.event.inputs.environment }}
-      config_file_path: app_config.yaml
       extra_config: ""
-      # Relying on the default options per environment
-      # do_run_unit_tests: ""
-      # do_build: ""
-      # do_update_vap: ""
-      # do_schedule_cade: ""
+      config_file_path: app_config.yaml
+      do_run_unit_tests: false
+      do_build: true
+      do_update_vap: true
+      do_schedule_cade: false
     secrets:
       SUBMODULE_KNOWN_HOSTS: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
       SUBMODULE_READ_KEY: ${{ secrets.SUBMODULE_READ_KEY }}
