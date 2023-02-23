@@ -15,7 +15,7 @@ on:
           - app_config.yaml
 jobs:
   "Deploy":
-    uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml
+    uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml@deployment-v1
     with:
       environment: ${{ github.event.inputs.environment }}
       config_file_path: ${{ github.event.inputs.config_file_path }}
