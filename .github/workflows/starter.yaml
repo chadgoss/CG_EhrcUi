@@ -13,7 +13,7 @@ on:
 
 jobs:
   "Deploy":
-    uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml@deployment-v2
+    uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml@deployment-v3
     with:
       environment: ${{ github.event.inputs.environment }}
       extra_config: ""
