@@ -12,21 +12,13 @@ on:
         - prod
 
 jobs:
-  "Deploy":
-    uses: chadgoss/CG_EhrcUi/.github/workflows/build_ehrc_ui.yaml@deployment-v3
-    with:
-      environment: ${{ github.event.inputs.environment }}
-      extra_config: ""
-      config_file_path: app_config.yaml
-      do_run_unit_tests: false
-      do_build: true
-      do_update_vap: true
-      do_schedule_cade: false
-    secrets:
-      SUBMODULE_KNOWN_HOSTS: ${{ secrets.SUBMODULE_KNOWN_HOSTS }}
-      SUBMODULE_READ_KEY: ${{ secrets.SUBMODULE_READ_KEY }}
-      SUBMODULE_READ_KEY_64: ${{ secrets.SUBMODULE_READ_KEY_64 }}
-      ARTIFACTORY_SVC_USER: ${{ secrets.ARTIFACTORY_SVC_USER }}
-      ARTIFACTORY_SVC_PASS: ${{ secrets.ARTIFACTORY_SVC_PASS }}
-      CADENCE_SVC_USER: ${{ secrets.CADENCE_SVC_USER }}
-      CADENCE_SVC_PASS: ${{ secrets.CADENCE_SVC_PASS }}
+  Build:
+    runs-on: [ubuntu-latest]
+    
+    steps:
+      - name: display
+        run: |
+          echo ${{ github.event.inputs.environment }}
+          echo vega-docker-${{ github.event.inputs.environment}}.docker.artifactory.viasat.com ehrcui latest
+
+    
