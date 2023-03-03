@@ -16,9 +16,12 @@ jobs:
     runs-on: [ubuntu-latest]
     
     steps:
-      - name: display
-        run: |
-          echo ${{ github.event.inputs.environment }}
-          echo vega-docker-${{ github.event.inputs.environment}}.docker.artifactory.viasat.com ehrcui latest
+
+      - name: Output Run ID
+        run: echo ${{ github.run_id }}
+      - name: Output Run Number
+        run: echo ${{ github.run_number }}
+      - name: Output Run Attempt
+        run: echo ${{ github.run_attempt }}
 
     
